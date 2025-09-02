@@ -360,3 +360,108 @@
     (ok (+ stacks-block-height DISPUTE-WINDOW-BLOCKS))
   )
 )
+
+;; UNILATERAL CHANNEL CLOSURE (STEP 2)  
+;; Finalizes channel closure after dispute period expires
+;; Can only be called after the dispute window has passed
+(define-public (finalize-channel-dispute
+    (channel-id (buff 32))
+    (counterparty principal)
+  )
+  (let (
+      (channel (unwrap! (get-channel-data channel-id tx-sender counterparty)
+        ERR-CHANNEL-NOT-FOUND
+      ))
+      (channel-key {
+        channel-id: channel-id,
+        participant-a: tx-sender,
+        participant-b: counterparty,
+      })
+      (final-balance-a (get balance-a channel))
+      (final-balance-b (get balance-b channel))
+    )
+    ;; Validation checks
+    (asserts! (is-valid-channel-id channel-id) ERR-INVALID-INPUT)
+    (asserts! (are-different-participants tx-sender counterparty)
+      ERR-INVALID-INPUT
+    )
+
+    ;; Ensure dispute period has ended
+    (asserts! (>= stacks-block-height (get dispute-deadline channel))
+      ERR-DISPUTE-PERIOD-ACTIVE
+    )
+
+    ;; Execute final settlement
+    (try! (as-contract (stx-transfer? final-balance-a tx-sender tx-sender)))
+    (try! (as-contract (stx-transfer? final-balance-b tx-sender counterparty)))
+
+    ;; Close channel
+    (map-set lightning-channels channel-key
+      (merge channel {
+        is-active: false,
+        balance-a: u0,
+        balance-b: u0,
+        total-locked: u0,
+      })
+    )
+
+    (ok true)
+  )
+)
+
+;;  READ-ONLY FUNCTIONS  
+
+;; GET CHANNEL STATUS
+;; Returns complete channel information for monitoring and UI purposes
+(define-read-only (get-lightning-channel-status
+    (channel-id (buff 32))
+    (participant-a principal)
+    (participant-b principal)
+  )
+  (get-channel-data channel-id participant-a participant-b)
+)
+
+;; GET CHANNEL BALANCE
+;; Returns current balance distribution within the channel
+(define-read-only (get-channel-balances
+    (channel-id (buff 32))
+    (participant-a principal)
+    (participant-b principal)
+  )
+  (match (get-channel-data channel-id participant-a participant-b)
+    channel-info (some {
+      balance-a: (get balance-a channel-info),
+      balance-b: (get balance-b channel-info),
+      total-locked: (get total-locked channel-info),
+    })
+    none
+  )
+)
+
+;; CHECK CHANNEL ACTIVE STATUS
+;; Quick check if channel is operational
+(define-read-only (is-channel-active
+    (channel-id (buff 32))
+    (participant-a principal)
+    (participant-b principal)
+  )
+  (match (get-channel-data channel-id participant-a participant-b)
+    channel-info (get is-active channel-info)
+    false
+  )
+)
+
+;; EMERGENCY FUNCTIONS
+
+;; EMERGENCY FUND RECOVERY
+;; Allows contract owner to recover funds in extreme circumstances
+;; This function should only be used if the contract has critical bugs
+(define-public (emergency-fund-recovery)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (try! (stx-transfer? (stx-get-balance (as-contract tx-sender))
+      (as-contract tx-sender) CONTRACT-OWNER
+    ))
+    (ok true)
+  )
+)
