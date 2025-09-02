@@ -236,3 +236,127 @@
     (ok additional-funding)
   )
 )
+
+;; CHANNEL CLOSURE
+
+;; COOPERATIVE CHANNEL CLOSURE
+;; Enables instant channel closure when both parties agree on final balances
+;; This is the preferred method as it avoids dispute periods and minimizes fees
+(define-public (close-channel-cooperative
+    (channel-id (buff 32))
+    (counterparty principal)
+    (final-balance-a uint)
+    (final-balance-b uint)
+    (signature-a (buff 65))
+    (signature-b (buff 65))
+  )
+  (let (
+      (channel (unwrap! (get-channel-data channel-id tx-sender counterparty)
+        ERR-CHANNEL-NOT-FOUND
+      ))
+      (channel-key {
+        channel-id: channel-id,
+        participant-a: tx-sender,
+        participant-b: counterparty,
+      })
+      (current-nonce (get state-nonce channel))
+      (settlement-message (create-channel-message channel-id final-balance-a final-balance-b
+        current-nonce
+      ))
+    )
+    ;; Validation checks
+    (asserts! (is-valid-channel-id channel-id) ERR-INVALID-INPUT)
+    (asserts! (is-valid-signature signature-a) ERR-INVALID-INPUT)
+    (asserts! (is-valid-signature signature-b) ERR-INVALID-INPUT)
+    (asserts! (are-different-participants tx-sender counterparty)
+      ERR-INVALID-INPUT
+    )
+    (asserts! (get is-active channel) ERR-CHANNEL-CLOSED)
+
+    ;; Verify balance conservation
+    (asserts!
+      (is-eq (get total-locked channel) (+ final-balance-a final-balance-b))
+      ERR-INSUFFICIENT-FUNDS
+    )
+
+    ;; Verify both party signatures
+    (asserts!
+      (and
+        (verify-channel-signature settlement-message signature-a tx-sender)
+        (verify-channel-signature settlement-message signature-b counterparty)
+      )
+      ERR-INVALID-SIGNATURE
+    )
+
+    ;; Execute settlement transfers
+    (try! (as-contract (stx-transfer? final-balance-a tx-sender tx-sender)))
+    (try! (as-contract (stx-transfer? final-balance-b tx-sender counterparty)))
+
+    ;; Close channel
+    (map-set lightning-channels channel-key
+      (merge channel {
+        is-active: false,
+        balance-a: u0,
+        balance-b: u0,
+        total-locked: u0,
+      })
+    )
+
+    (ok true)
+  )
+)
+
+;; UNILATERAL CHANNEL CLOSURE (STEP 1)
+;; Initiates channel closure when counterparty is unresponsive
+;; Starts dispute period allowing counterparty to challenge proposed balances
+(define-public (initiate-channel-dispute
+    (channel-id (buff 32))
+    (counterparty principal)
+    (claimed-balance-a uint)
+    (claimed-balance-b uint)
+    (state-signature (buff 65))
+  )
+  (let (
+      (channel (unwrap! (get-channel-data channel-id tx-sender counterparty)
+        ERR-CHANNEL-NOT-FOUND
+      ))
+      (channel-key {
+        channel-id: channel-id,
+        participant-a: tx-sender,
+        participant-b: counterparty,
+      })
+      (current-nonce (get state-nonce channel))
+      (dispute-message (create-channel-message channel-id claimed-balance-a claimed-balance-b
+        current-nonce
+      ))
+    )
+    ;; Validation checks
+    (asserts! (is-valid-channel-id channel-id) ERR-INVALID-INPUT)
+    (asserts! (is-valid-signature state-signature) ERR-INVALID-INPUT)
+    (asserts! (are-different-participants tx-sender counterparty)
+      ERR-INVALID-INPUT
+    )
+    (asserts! (get is-active channel) ERR-CHANNEL-CLOSED)
+
+    ;; Verify signature and balance conservation
+    (asserts!
+      (verify-channel-signature dispute-message state-signature tx-sender)
+      ERR-INVALID-SIGNATURE
+    )
+    (asserts!
+      (is-eq (get total-locked channel) (+ claimed-balance-a claimed-balance-b))
+      ERR-INSUFFICIENT-FUNDS
+    )
+
+    ;; Set dispute deadline and proposed balances
+    (map-set lightning-channels channel-key
+      (merge channel {
+        dispute-deadline: (+ stacks-block-height DISPUTE-WINDOW-BLOCKS),
+        balance-a: claimed-balance-a,
+        balance-b: claimed-balance-b,
+      })
+    )
+
+    (ok (+ stacks-block-height DISPUTE-WINDOW-BLOCKS))
+  )
+)
