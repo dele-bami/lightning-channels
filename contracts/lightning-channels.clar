@@ -111,3 +111,128 @@
 (define-private (uint-to-consensus-buff (value uint))
   (unwrap-panic (to-consensus-buff? value))
 )
+
+;; Creates message hash for signature verification
+;; Message format: channel-id + balance-a + balance-b + nonce
+(define-private (create-channel-message
+    (channel-id (buff 32))
+    (balance-a uint)
+    (balance-b uint)
+    (nonce uint)
+  )
+  (concat
+    (concat (concat channel-id (uint-to-consensus-buff balance-a))
+      (uint-to-consensus-buff balance-b)
+    )
+    (uint-to-consensus-buff nonce)
+  )
+)
+
+;; Simplified signature verification (placeholder for production cryptographic verification)
+;; In production, this would verify secp256k1 signatures against message hashes
+(define-private (verify-channel-signature
+    (message (buff 256))
+    (signature (buff 65))
+    (expected-signer principal)
+  )
+  ;; NOTE: This is a simplified implementation
+  ;; Production version should implement proper secp256k1 signature verification
+  (is-eq tx-sender expected-signer)
+)
+
+;; Retrieves channel data with error handling
+(define-private (get-channel-data
+    (channel-id (buff 32))
+    (participant-a principal)
+    (participant-b principal)
+  )
+  (map-get? lightning-channels {
+    channel-id: channel-id,
+    participant-a: participant-a,
+    participant-b: participant-b,
+  })
+)
+
+;; CHANNEL MANAGEMENT
+
+;; OPEN LIGHTNING CHANNEL
+;; Creates a new bidirectional payment channel with initial funding
+;; The channel enables unlimited off-chain transactions between participants
+(define-public (open-lightning-channel
+    (channel-id (buff 32))
+    (counterparty principal)
+    (initial-funding uint)
+  )
+  (let ((channel-key {
+      channel-id: channel-id,
+      participant-a: tx-sender,
+      participant-b: counterparty,
+    }))
+    ;; Input validation
+    (asserts! (is-valid-channel-id channel-id) ERR-INVALID-INPUT)
+    (asserts! (is-valid-deposit initial-funding) ERR-INVALID-INPUT)
+    (asserts! (are-different-participants tx-sender counterparty)
+      ERR-INVALID-INPUT
+    )
+
+    ;; Ensure channel doesn't already exist
+    (asserts! (is-none (get-channel-data channel-id tx-sender counterparty))
+      ERR-CHANNEL-EXISTS
+    )
+
+    ;; Lock STX tokens in contract escrow
+    (try! (stx-transfer? initial-funding tx-sender (as-contract tx-sender)))
+
+    ;; Initialize channel state
+    (map-set lightning-channels channel-key {
+      total-locked: initial-funding,
+      balance-a: initial-funding,
+      balance-b: u0,
+      is-active: true,
+      dispute-deadline: u0,
+      state-nonce: u0,
+    })
+
+    (ok channel-id)
+  )
+)
+
+;; FUND LIGHTNING CHANNEL  
+;; Adds additional STX to an existing channel, increasing available liquidity
+(define-public (fund-lightning-channel
+    (channel-id (buff 32))
+    (counterparty principal)
+    (additional-funding uint)
+  )
+  (let (
+      (channel (unwrap! (get-channel-data channel-id tx-sender counterparty)
+        ERR-CHANNEL-NOT-FOUND
+      ))
+      (channel-key {
+        channel-id: channel-id,
+        participant-a: tx-sender,
+        participant-b: counterparty,
+      })
+    )
+    ;; Input validation
+    (asserts! (is-valid-channel-id channel-id) ERR-INVALID-INPUT)
+    (asserts! (is-valid-deposit additional-funding) ERR-INVALID-INPUT)
+    (asserts! (are-different-participants tx-sender counterparty)
+      ERR-INVALID-INPUT
+    )
+    (asserts! (get is-active channel) ERR-CHANNEL-CLOSED)
+
+    ;; Transfer additional funds to channel
+    (try! (stx-transfer? additional-funding tx-sender (as-contract tx-sender)))
+
+    ;; Update channel balances
+    (map-set lightning-channels channel-key
+      (merge channel {
+        total-locked: (+ (get total-locked channel) additional-funding),
+        balance-a: (+ (get balance-a channel) additional-funding),
+      })
+    )
+
+    (ok additional-funding)
+  )
+)
